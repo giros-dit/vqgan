@@ -35,6 +35,8 @@ def parse_args():
     p.add_argument("-save", action="store_true")
     p.add_argument("--filename", type=str, default=None,
                    help="Ruta del .pth (por defecto: <dataset>/vqgan-models-{q}/nembeddings{K}/model.pth)")
+    p.add_argument("--disc_norm", type=str, default="batch", choices=["batch", "none"],
+                   help="Normalización del discriminador (batch = BatchNorm, none = sin normalización)")
     args = p.parse_args()
 
     # Lo que necesitan el modelo y el discriminador, sacado de la tabla de datasets
@@ -149,8 +151,12 @@ def main():
         rec_loss = torch.mean((x_fake - x_real) ** 2) / x_train_var
 
         disc_factor = vqgan.adopt_weight(args.disc_factor, i, threshold=args.disc_start)
+        B = x_real.shape[0]
         if disc_factor > 0:
-            g_loss = -torch.mean(discriminator(x_fake))
+            # Real y reconstruido en el MISMO lote: con lotes separados la BatchNorm
+            # deja al discriminador distinguir lotes en vez de grids (ver diagnóstico)
+            logits = discriminator(torch.cat([x_real, x_fake], dim=0))
+            g_loss = -torch.mean(logits[B:])
             lam = vqgan.calculate_lambda(rec_loss, g_loss)
         else:
             # Antes de disc_start no se calcula nada del discriminador (ni λ)
@@ -166,8 +172,8 @@ def main():
         # ---------------- Discriminador (pérdida hinge) ----------------
         d_loss = torch.zeros((), device=device)
         if disc_factor > 0:
-            d_real = discriminator(x_real)
-            d_fake = discriminator(x_fake.detach())   # detach: este paso no toca el generador
+            logits = discriminator(torch.cat([x_real, x_fake.detach()], dim=0))  # detach: no toca el generador
+            d_real, d_fake = logits[:B], logits[B:]
             d_loss = 0.5 * (torch.mean(F.relu(1.0 - d_real)) + torch.mean(F.relu(1.0 + d_fake)))
 
             opt_disc.zero_grad()
