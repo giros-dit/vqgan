@@ -1,120 +1,225 @@
-import os
 import argparse
-from tqdm import tqdm
+import os
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torchvision import utils as vutils
+from tqdm import tqdm
+
 from discriminator import Discriminator
-from lpips import LPIPS
 from vqgan import VQGAN
-from utils import load_data, weights_init
+from utils import DATASETS, get_spec, load_data, models_dir, weights_init, plot_comparison
 
 
-class TrainVQGAN:
-    def __init__(self, args):
-        self.vqgan = VQGAN(args).to(device=args.device)
-        self.discriminator = Discriminator(args).to(device=args.device)
-        self.discriminator.apply(weights_init)
-        self.perceptual_loss = LPIPS().eval().to(device=args.device)
-        self.opt_vq, self.opt_disc = self.configure_optimizers(args)
+def parse_args():
+    p = argparse.ArgumentParser(description="Entrenamiento del VQGAN (FAWN / GIROS / CAEZ / FRAUNHOFER)")
+    p.add_argument("--dataset", type=str, default="GIROS", choices=DATASETS.keys())
+    p.add_argument("--quantizer", type=str, default="ema", choices=["ema", "original"])
+    p.add_argument("--n_embeddings", type=int, default=512, help="K: número de vectores del codebook")
+    p.add_argument("--embedding_dim", type=int, default=64, help="Números por vector (igual que el VQ-VAE)")
+    p.add_argument("--beta", type=float, default=0.25)
+    p.add_argument("--batch_size", type=int, default=32)
+    p.add_argument("--n_updates", type=int, default=5000)
+    p.add_argument("--learning_rate", type=float, default=1e-4)
+    p.add_argument("--beta1", type=float, default=0.5)
+    p.add_argument("--beta2", type=float, default=0.9)
+    p.add_argument("--disc_start", type=int, default=500,
+                   help="Update a partir del cual actúa el discriminador")
+    p.add_argument("--disc_factor", type=float, default=1.0,
+                   help="Peso del discriminador (0 = sin discriminador, para la prueba de ablación)")
+    p.add_argument("--log_interval", type=int, default=50)
+    p.add_argument("--eval_interval", type=int, default=1000,
+                   help="Cada cuántos updates se evalúa en validación y se guarda el modelo")
+    p.add_argument("--val_batches", type=int, default=50,
+                   help="Lotes de validación en cada evaluación (0 = todos)")
+    p.add_argument("--num_workers", type=int, default=2)
+    p.add_argument("-save", action="store_true")
+    p.add_argument("--filename", type=str, default=None,
+                   help="Ruta del .pth (por defecto: <dataset>/vqgan-models-{q}/nembeddings{K}/model.pth)")
+    args = p.parse_args()
 
-        self.prepare_training()
+    # Lo que necesitan el modelo y el discriminador, sacado de la tabla de datasets
+    spec = get_spec(args.dataset)
+    args.image_channels = spec["channels"]
+    args.height = spec["height"]
+    args.latent_dim = args.embedding_dim
+    args.num_codebook_vectors = args.n_embeddings
 
-        self.train(args)
-
-    def configure_optimizers(self, args):
-        lr = args.learning_rate
-        opt_vq = torch.optim.Adam(
-            list(self.vqgan.encoder.parameters()) +
-            list(self.vqgan.decoder.parameters()) +
-            list(self.vqgan.codebook.parameters()) +
-            list(self.vqgan.quant_conv.parameters()) +
-            list(self.vqgan.post_quant_conv.parameters()),
-            lr=lr, eps=1e-08, betas=(args.beta1, args.beta2)
-        )
-        opt_disc = torch.optim.Adam(self.discriminator.parameters(),
-                                    lr=lr, eps=1e-08, betas=(args.beta1, args.beta2))
-
-        return opt_vq, opt_disc
-
-    @staticmethod
-    def prepare_training():
-        os.makedirs("results", exist_ok=True)
-        os.makedirs("checkpoints", exist_ok=True)
-
-    def train(self, args):
-        train_dataset = load_data(args)
-        steps_per_epoch = len(train_dataset)
-        for epoch in range(args.epochs):
-            with tqdm(range(len(train_dataset))) as pbar:
-                for i, imgs in zip(pbar, train_dataset):
-                    imgs = imgs.to(device=args.device)
-                    decoded_images, _, q_loss = self.vqgan(imgs)
-
-                    disc_real = self.discriminator(imgs)
-                    disc_fake = self.discriminator(decoded_images)
-
-                    disc_factor = self.vqgan.adopt_weight(args.disc_factor, epoch*steps_per_epoch+i, threshold=args.disc_start)
-
-                    perceptual_loss = self.perceptual_loss(imgs, decoded_images)
-                    rec_loss = torch.abs(imgs - decoded_images)
-                    perceptual_rec_loss = args.perceptual_loss_factor * perceptual_loss + args.rec_loss_factor * rec_loss
-                    perceptual_rec_loss = perceptual_rec_loss.mean()
-                    g_loss = -torch.mean(disc_fake)
-
-                    λ = self.vqgan.calculate_lambda(perceptual_rec_loss, g_loss)
-                    vq_loss = perceptual_rec_loss + q_loss + disc_factor * λ * g_loss
-
-                    d_loss_real = torch.mean(F.relu(1. - disc_real))
-                    d_loss_fake = torch.mean(F.relu(1. + disc_fake))
-                    gan_loss = disc_factor * 0.5*(d_loss_real + d_loss_fake)
-
-                    self.opt_vq.zero_grad()
-                    vq_loss.backward(retain_graph=True)
-
-                    self.opt_disc.zero_grad()
-                    gan_loss.backward()
-
-                    self.opt_vq.step()
-                    self.opt_disc.step()
-
-                    if i % 10 == 0:
-                        with torch.no_grad():
-                            real_fake_images = torch.cat((imgs[:4], decoded_images.add(1).mul(0.5)[:4]))
-                            vutils.save_image(real_fake_images, os.path.join("results", f"{epoch}_{i}.jpg"), nrow=4)
-
-                    pbar.set_postfix(
-                        VQ_Loss=np.round(vq_loss.cpu().detach().numpy().item(), 5),
-                        GAN_Loss=np.round(gan_loss.cpu().detach().numpy().item(), 3)
-                    )
-                    pbar.update(0)
-                torch.save(self.vqgan.state_dict(), os.path.join("checkpoints", f"vqgan_epoch_{epoch}.pt"))
+    if args.filename is None:
+        sub = f"nembeddings{args.n_embeddings}" + ("_sin_disc" if args.disc_factor == 0 else "")
+        args.filename = os.path.join(models_dir(args.dataset, args.quantizer), sub, "model.pth")
+    return args
 
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="VQGAN")
-    parser.add_argument('--latent-dim', type=int, default=256, help='Latent dimension n_z (default: 256)')
-    parser.add_argument('--image-size', type=int, default=256, help='Image height and width (default: 256)')
-    parser.add_argument('--num-codebook-vectors', type=int, default=1024, help='Number of codebook vectors (default: 256)')
-    parser.add_argument('--beta', type=float, default=0.25, help='Commitment loss scalar (default: 0.25)')
-    parser.add_argument('--image-channels', type=int, default=3, help='Number of channels of images (default: 3)')
-    parser.add_argument('--dataset-path', type=str, default='/data', help='Path to data (default: /data)')
-    parser.add_argument('--device', type=str, default="cuda", help='Which device the training is on')
-    parser.add_argument('--batch-size', type=int, default=6, help='Input batch size for training (default: 6)')
-    parser.add_argument('--epochs', type=int, default=100, help='Number of epochs to train (default: 50)')
-    parser.add_argument('--learning-rate', type=float, default=2.25e-05, help='Learning rate (default: 0.0002)')
-    parser.add_argument('--beta1', type=float, default=0.5, help='Adam beta param (default: 0.0)')
-    parser.add_argument('--beta2', type=float, default=0.9, help='Adam beta param (default: 0.999)')
-    parser.add_argument('--disc-start', type=int, default=10000, help='When to start the discriminator (default: 0)')
-    parser.add_argument('--disc-factor', type=float, default=1., help='')
-    parser.add_argument('--rec-loss-factor', type=float, default=1., help='Weighting factor for reconstruction loss.')
-    parser.add_argument('--perceptual-loss-factor', type=float, default=1., help='Weighting factor for perceptual loss.')
+def nmse_ratios(real, recon):
+    """NMSE lineal de cada grid: ||x - x_hat||^2 / ||x||^2 (los grids con potencia 0 se descartan)."""
+    mse = torch.sum((real - recon) ** 2, dim=(1, 2, 3))
+    power = torch.sum(real ** 2, dim=(1, 2, 3))
+    keep = power > 0
+    return (mse[keep] / power[keep]).cpu()
 
-    args = parser.parse_args()
-    args.dataset_path = r"C:\Users\dome\datasets\flowers"
 
-    train_vqgan = TrainVQGAN(args)
+@torch.no_grad()
+def evaluate(vqgan, loader, height, device, max_batches=0):
+    """NMSE de validación: media en LINEAL de todos los grids y conversión a dB al final."""
+    vqgan.eval()
+    ratios, last = [], None
+    for b, (x, _) in enumerate(loader):
+        if max_batches and b >= max_batches:
+            break
+        x = x.to(device)
+        recon = vqgan.reconstruct(x)              # ya sin filas de padding
+        ratios.append(nmse_ratios(x[:, :, :height, :], recon))
+        last = (x, recon)
+    vqgan.train()
+    r = torch.cat(ratios)
+    nmse_db = 10 * np.log10(r.mean().item()) if len(r) > 0 else float("nan")
+    return nmse_db, last
+
+
+def save_checkpoint(path, vqgan, discriminator, results, args):
+    """Mismo formato que el VQ-VAE: model, results, hyperparameters (+ discriminador)."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    torch.save({
+        "model": vqgan.state_dict(),
+        "discriminator": discriminator.state_dict(),
+        "results": results,
+        "hyperparameters": dict(vars(args)),
+    }, path)
+
+
+def main():
+    args = parse_args()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    h = args.height
+    plot_dir = os.path.join("resultados_vqgan", args.dataset, args.quantizer)
+
+    print(f"--> Dispositivo: {device}")
+    print(f"--> Dataset: {args.dataset} | canales: {args.image_channels} | filas reales: {h}")
+    print(f"--> Cuantizador: {args.quantizer} | K = {args.n_embeddings} | dimensión = {args.embedding_dim}")
+    print(f"--> Discriminador: factor {args.disc_factor}, desde el update {args.disc_start}")
+    if args.save:
+        print(f"--> Modelo: {args.filename}")
+
+    train_loader, val_loader, _, x_train_var = load_data(args)
+
+    vqgan = VQGAN(args).to(device)
+    discriminator = Discriminator(args).to(device)
+    discriminator.apply(weights_init)
+
+    # Con EMA el codebook no lleva gradiente: solo se optimiza lo que lo tiene
+    opt_vq = torch.optim.Adam(
+        [p for p in vqgan.parameters() if p.requires_grad],
+        lr=args.learning_rate, betas=(args.beta1, args.beta2), eps=1e-8,
+    )
+    opt_disc = torch.optim.Adam(
+        discriminator.parameters(),
+        lr=args.learning_rate, betas=(args.beta1, args.beta2), eps=1e-8,
+    )
+
+    results = {
+        "n_updates": 0,
+        "recon_errors": [], "loss_vals": [], "perplexities": [],
+        "g_losses": [], "d_losses": [], "lambdas": [],
+        "val_nmse_db": [],          # lista de (update, NMSE en dB)
+    }
+
+    steps_per_epoch = len(train_loader)
+    print(f"--> {args.n_updates} updates | {steps_per_epoch} updates por época "
+          f"(≈ {args.n_updates / steps_per_epoch:.2f} épocas)")
+
+    vqgan.train()
+    discriminator.train()
+    train_iter = iter(train_loader)
+    pbar = tqdm(range(args.n_updates), desc="Entrenando", unit="upd", dynamic_ncols=True)
+
+    for i in pbar:
+        try:
+            x, _ = next(train_iter)
+        except StopIteration:
+            train_iter = iter(train_loader)
+            x, _ = next(train_iter)
+        x = x.to(device)
+        x_real = x[:, :, :h, :]                   # sin filas de padding
+
+        # ---------------- Generador (encoder + codebook + decoder) ----------------
+        decoded, _, q_loss, perplexity = vqgan(x)
+        x_fake = decoded[:, :, :h, :]
+
+        # Misma pérdida de reconstrucción que el VQ-VAE: MSE / varianza del train
+        rec_loss = torch.mean((x_fake - x_real) ** 2) / x_train_var
+
+        disc_factor = vqgan.adopt_weight(args.disc_factor, i, threshold=args.disc_start)
+        if disc_factor > 0:
+            g_loss = -torch.mean(discriminator(x_fake))
+            lam = vqgan.calculate_lambda(rec_loss, g_loss)
+        else:
+            # Antes de disc_start no se calcula nada del discriminador (ni λ)
+            g_loss = torch.zeros((), device=device)
+            lam = torch.zeros((), device=device)
+
+        loss = rec_loss + q_loss + disc_factor * lam * g_loss
+
+        opt_vq.zero_grad()
+        loss.backward()
+        opt_vq.step()
+
+        # ---------------- Discriminador (pérdida hinge) ----------------
+        d_loss = torch.zeros((), device=device)
+        if disc_factor > 0:
+            d_real = discriminator(x_real)
+            d_fake = discriminator(x_fake.detach())   # detach: este paso no toca el generador
+            d_loss = 0.5 * (torch.mean(F.relu(1.0 - d_real)) + torch.mean(F.relu(1.0 + d_fake)))
+
+            opt_disc.zero_grad()
+            (disc_factor * d_loss).backward()
+            opt_disc.step()
+
+        # ---------------- Registro ----------------
+        results["recon_errors"].append(rec_loss.item())
+        results["loss_vals"].append(loss.item())
+        results["perplexities"].append(perplexity.item())
+        results["g_losses"].append(g_loss.item())
+        results["d_losses"].append(d_loss.item())
+        results["lambdas"].append(lam.item())
+        results["n_updates"] = i + 1
+
+        if i % 10 == 0:
+            pbar.set_postfix(
+                epoca=f"{i / steps_per_epoch:.2f}",
+                recon=f"{np.mean(results['recon_errors'][-10:]):.4f}",
+                perp=f"{np.mean(results['perplexities'][-10:]):.1f}",
+                D=f"{np.mean(results['d_losses'][-10:]):.3f}",
+            )
+
+        if i % args.log_interval == 0:
+            n = args.log_interval
+            tqdm.write(
+                f"Update #{i} | Recon: {np.mean(results['recon_errors'][-n:]):.5f} | "
+                f"Loss: {np.mean(results['loss_vals'][-n:]):.5f} | "
+                f"Perp: {np.mean(results['perplexities'][-n:]):.1f} | "
+                f"G: {np.mean(results['g_losses'][-n:]):.4f} | "
+                f"D: {np.mean(results['d_losses'][-n:]):.4f} | "
+                f"λ: {np.mean(results['lambdas'][-n:]):.4f}"
+            )
+
+        if (i + 1) % args.eval_interval == 0 or (i + 1) == args.n_updates:
+            val_db, last = evaluate(vqgan, val_loader, h, device, args.val_batches)
+            results["val_nmse_db"].append((i + 1, val_db))
+            tqdm.write(f"[Update {i + 1}] NMSE de validación: {val_db:.2f} dB")
+            if last is not None:
+                plot_comparison(last[0], last[1], h, save_path=os.path.join(
+                    plot_dir, f"val_K{args.n_embeddings}_upd{i + 1}.png"))
+            if args.save:
+                save_checkpoint(args.filename, vqgan, discriminator, results, args)
+
+    pbar.close()
+    if args.save:
+        save_checkpoint(args.filename, vqgan, discriminator, results, args)
+        print(f"--> Modelo final guardado en: {args.filename}")
+
+
+if __name__ == "__main__":
+    main()
 
 
 

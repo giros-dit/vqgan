@@ -2,56 +2,102 @@ import torch
 import torch.nn as nn
 from encoder import Encoder
 from decoder import Decoder
-from codebook import Codebook
+from quantizer import VectorQuantizer, VectorQuantizerEMA
 
 
 class VQGAN(nn.Module):
+    """
+    VQGAN para grids de canal: Encoder -> quant_conv -> cuantizador -> post_quant_conv -> Decoder.
+    Entrada (B, C, padded_H, W) -> latente (B, latent_dim, padded_H / 16, W) -> salida (B, C, padded_H, W).
+
+    Necesita en args: image_channels, latent_dim, num_codebook_vectors, beta,
+    quantizer ("ema" | "original") y height (filas reales, para quitar el padding).
+
+    El cuantizador es EXACTAMENTE el mismo fichero que en el VQ-VAE (quantizer.py):
+      - "ema":      VectorQuantizerEMA (codebook por media móvil + reinicio de códigos muertos)
+      - "original": VectorQuantizer (codebook por gradiente, con el error heredado de beta)
+    """
+
     def __init__(self, args):
         super(VQGAN, self).__init__()
-        self.encoder = Encoder(args).to(device=args.device)
-        self.decoder = Decoder(args).to(device=args.device)
-        self.codebook = Codebook(args).to(device=args.device)
-        self.quant_conv = nn.Conv2d(args.latent_dim, args.latent_dim, 1).to(device=args.device)
-        self.post_quant_conv = nn.Conv2d(args.latent_dim, args.latent_dim, 1).to(device=args.device)
+        self.args = args
+        self.height = getattr(args, "height", None)
+        quantizer = getattr(args, "quantizer", "ema")
+
+        self.encoder = Encoder(args)
+        self.decoder = Decoder(args)
+        self.quant_conv = nn.Conv2d(args.latent_dim, args.latent_dim, kernel_size=1)
+        self.post_quant_conv = nn.Conv2d(args.latent_dim, args.latent_dim, kernel_size=1)
+
+        if quantizer == "ema":
+            self.codebook = VectorQuantizerEMA(
+                args.num_codebook_vectors, args.latent_dim, args.beta)
+        elif quantizer == "original":
+            self.codebook = VectorQuantizer(
+                args.num_codebook_vectors, args.latent_dim, args.beta)
+        else:
+            raise ValueError(f"quantizer debe ser 'ema' u 'original', no '{quantizer}'")
+
+    def quantize(self, z):
+        """
+        Adaptador: el cuantizador del VQ-VAE devuelve
+            (loss, z_q, perplexity, min_encodings, min_encoding_indices)
+        y aquí se reordena a (z_q, índices en rejilla (B, H, W), loss, perplexity).
+        """
+        b, _, h, w = z.shape
+        q_loss, z_q, perplexity, _, indices = self.codebook(z)
+        return z_q, indices.view(b, h, w), q_loss, perplexity
 
     def forward(self, imgs):
-        encoded_images = self.encoder(imgs)
-        quant_conv_encoded_images = self.quant_conv(encoded_images)
-        codebook_mapping, codebook_indices, q_loss = self.codebook(quant_conv_encoded_images)
-        post_quant_conv_mapping = self.post_quant_conv(codebook_mapping)
-        decoded_images = self.decoder(post_quant_conv_mapping)
-
-        return decoded_images, codebook_indices, q_loss
+        """Devuelve: reconstrucción (con padding), índices (B, H/16, W), q_loss, perplejidad."""
+        z = self.quant_conv(self.encoder(imgs))
+        z_q, indices, q_loss, perplexity = self.quantize(z)
+        decoded = self.decoder(self.post_quant_conv(z_q))
+        return decoded, indices, q_loss, perplexity
 
     def encode(self, imgs):
-        encoded_images = self.encoder(imgs)
-        quant_conv_encoded_images = self.quant_conv(encoded_images)
-        codebook_mapping, codebook_indices, q_loss = self.codebook(quant_conv_encoded_images)
-        return codebook_mapping, codebook_indices, q_loss
+        """Comprime a índices discretos. Devuelve z_q, índices, q_loss, perplejidad."""
+        z = self.quant_conv(self.encoder(imgs))
+        return self.quantize(z)
 
-    def decode(self, z):
-        post_quant_conv_mapping = self.post_quant_conv(z)
-        decoded_images = self.decoder(post_quant_conv_mapping)
-        return decoded_images
+    def decode(self, z_q):
+        """Reconstruye a partir del latente cuantizado."""
+        return self.decoder(self.post_quant_conv(z_q))
 
-    def calculate_lambda(self, perceptual_loss, gan_loss):
-        last_layer = self.decoder.model[-1]
-        last_layer_weight = last_layer.weight
-        perceptual_loss_grads = torch.autograd.grad(perceptual_loss, last_layer_weight, retain_graph=True)[0]
-        gan_loss_grads = torch.autograd.grad(gan_loss, last_layer_weight, retain_graph=True)[0]
+    def reconstruct(self, imgs, crop=True):
+        """Reconstrucción; con crop=True quita las filas de padding."""
+        decoded, _, _, _ = self.forward(imgs)
+        if crop and self.height is not None:
+            return decoded[:, :, :self.height, :]
+        return decoded
 
-        λ = torch.norm(perceptual_loss_grads) / (torch.norm(gan_loss_grads) + 1e-4)
-        λ = torch.clamp(λ, 0, 1e4).detach()
+    def calculate_lambda(self, rec_loss, g_loss):
+        """
+        λ adaptativo (Esser et al., 2021): iguala lo que empujan la pérdida de
+        reconstrucción y la adversarial a la última capa del decoder.
+        """
+        last_layer_weight = self.decoder.model[-1].weight
+        rec_grads = torch.autograd.grad(rec_loss, last_layer_weight, retain_graph=True)[0]
+        g_grads = torch.autograd.grad(g_loss, last_layer_weight, retain_graph=True)[0]
+
+        λ = torch.norm(rec_grads) / (torch.norm(g_grads) + 1e-4)
+        λ = torch.clamp(λ, 0.0, 1e4).detach()
         return 0.8 * λ
 
     @staticmethod
-    def adopt_weight(disc_factor, i, threshold, value=0.):
-        if i < threshold:
+    def adopt_weight(disc_factor, step, threshold, value=0.0):
+        """Activa el discriminador solo a partir del paso threshold."""
+        if step < threshold:
             disc_factor = value
         return disc_factor
 
-    def load_checkpoint(self, path):
-        self.load_state_dict(torch.load(path))
+    def load_checkpoint(self, path, device="cpu"):
+        """Carga los pesos (mismo formato de checkpoint que el VQ-VAE: clave 'model')."""
+        checkpoint = torch.load(path, map_location=device, weights_only=False)
+        if isinstance(checkpoint, dict) and "model" in checkpoint:
+            self.load_state_dict(checkpoint["model"])
+        else:
+            self.load_state_dict(checkpoint)
 
 
 
