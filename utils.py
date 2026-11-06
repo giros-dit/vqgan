@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+import math
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -44,20 +45,34 @@ DATASETS = {
 }
 
 
-def get_spec(dataset_name):
+def get_spec(dataset_name, downsample=16):
+    """Datos del dataset, con el padding calculado para la reducción del encoder (16 o 4)."""
     if dataset_name not in DATASETS:
         raise ValueError(f"Dataset '{dataset_name}' no soportado. Opciones: {list(DATASETS)}")
-    return DATASETS[dataset_name]
+    spec = dict(DATASETS[dataset_name])
+    spec["downsample"] = downsample
+    spec["padded_height"] = math.ceil(spec["height"] / downsample) * downsample
+    return spec
 
 
-def models_dir(dataset_name, quantizer):
-    """<dataset>/vqgan-models-{q}"""
-    return os.path.join(get_spec(dataset_name)["base_dir"], VQGAN_MODELS_SUBDIR.format(q=quantizer))
+def _suffix(spec):
+    """'_amp' para GIROS_AMP y '_x4' si la reducción no es la original (16)."""
+    s = spec.get("tag", "")
+    if spec["downsample"] != 16:
+        s += f"_x{spec['downsample']}"
+    return s
 
 
-def recon_dir(dataset_name, quantizer):
-    """<dataset>/vqgand_{q}"""
-    return os.path.join(get_spec(dataset_name)["base_dir"], VQGAN_RECON_SUBDIR.format(q=quantizer))
+def models_dir(dataset_name, quantizer, downsample=16):
+    """<dataset>/vqgan-models-{q}{sufijo}"""
+    spec = get_spec(dataset_name, downsample)
+    return os.path.join(spec["base_dir"], VQGAN_MODELS_SUBDIR.format(q=quantizer) + _suffix(spec))
+
+
+def recon_dir(dataset_name, quantizer, downsample=16):
+    """<dataset>/vqgand_{q}{sufijo}"""
+    spec = get_spec(dataset_name, downsample)
+    return os.path.join(spec["base_dir"], VQGAN_RECON_SUBDIR.format(q=quantizer) + _suffix(spec))
 
 
 def fit_to_spec(x, spec):
@@ -125,7 +140,7 @@ def load_data(args, compute_variance=True):
     Devuelve: train_loader, val_loader, test_data, x_train_var
     Los grids salen como (B, C, padded_height, width) y los nombres como lista.
     """
-    spec = get_spec(args.dataset)
+    spec = get_spec(args.dataset, getattr(args, "downsample", 16))
     dataset = spec["make_dataset"](spec["root_dir"])
     train_data, val_data, test_data = split_dataset(dataset)
 

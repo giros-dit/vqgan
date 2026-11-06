@@ -16,6 +16,8 @@ def parse_args():
     p.add_argument("--quantizer", type=str, default="ema", choices=["ema", "original"])
     p.add_argument("--n_embeddings", type=int, default=512, help="K: número de vectores del codebook")
     p.add_argument("--embedding_dim", type=int, default=64, help="Números por vector (igual que el VQ-VAE)")
+    p.add_argument("--downsample", type=int, default=16, choices=[4, 16],
+                   help="Reducción del encoder en el eje vertical (16 = VQGAN original, 4 = como el VQ-VAE)")
     p.add_argument("--beta", type=float, default=0.25)
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--n_updates", type=int, default=5000)
@@ -48,7 +50,7 @@ def parse_args():
 
     if args.filename is None:
         sub = f"nembeddings{args.n_embeddings}" + ("_sin_disc" if args.disc_factor == 0 else "")
-        args.filename = os.path.join(models_dir(args.dataset, args.quantizer), sub, "model.pth")
+        args.filename = os.path.join(models_dir(args.dataset, args.quantizer, args.downsample), sub, "model.pth")
     return args
 
 
