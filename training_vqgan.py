@@ -154,7 +154,7 @@ def main():
         B = x_real.shape[0]
         if disc_factor > 0:
             # Real y reconstruido en el MISMO lote: con lotes separados la BatchNorm
-            # deja al discriminador distinguir lotes en vez de grids (ver diagnóstico)
+            # deja al discriminador distinguir lotes en vez de grids 
             logits = discriminator(torch.cat([x_real, x_fake], dim=0))
             g_loss = -torch.mean(logits[B:])
             lam = vqgan.calculate_lambda(rec_loss, g_loss)
