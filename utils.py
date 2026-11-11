@@ -1,57 +1,86 @@
+import math
 import os
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-import math
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from config import (
-    FAWN_DIR, GIROS_DIR, CAEZ_DIR, FRAUNHOFER_DIR,
-    FAWN_ROOT_DIR, GIROS_ROOT_DIR, CAEZ_ROOT_DIR, FRAUNHOFER_ROOT_DIR,
+    FAWN_DIR, GIROS_DIR, CAEZ_DIR, FRAUNHOFER_DIR, MMGESTURE_DIR,
+    FAWN_ROOT_DIR, GIROS_ROOT_DIR, CAEZ_ROOT_DIR, FRAUNHOFER_ROOT_DIR, MMGESTURE_ROOT_DIR,
     VQGAN_MODELS_SUBDIR, VQGAN_RECON_SUBDIR,
 )
 from grid_tensor_fawn_dataset import FAWNGridSymbolTensorDataset
 from grid_tensor_giros_dataset import GIROSTensorDataset
 from grid_tensor_caez_dataset import CAEZGridTensorDataset
 from grid_tensor_fraunhofer_dataset import FraunhoferTensorDataset
+from grid_tensor_5gmmgesture_dataset import MMGestureTensorDataset
 
-# El encoder del VQGAN reduce x16 en el eje vertical (frecuencia / retardo).
-# padded_height = múltiplo de 16 más cercano por encima de height.
+# height = filas reales (eje que se reduce), width = columnas reales.
+# down2d = True: la reducción se reparte entre los dos ejes (solo 5GmmGesture).
+# El padding (padded_height, padded_width) lo calcula get_spec según --downsample.
 DATASETS = {
     "FAWN": dict(
-        channels=2, height=360, padded_height=368, width=6,
+        channels=2, height=360, width=6,
         base_dir=FAWN_DIR, root_dir=FAWN_ROOT_DIR,
         make_dataset=FAWNGridSymbolTensorDataset,
     ),
     "GIROS": dict(
-        channels=2, height=540, padded_height=544, width=14,
+        channels=2, height=540, width=14,
         base_dir=GIROS_DIR, root_dir=GIROS_ROOT_DIR,
         make_dataset=GIROSTensorDataset,
     ),
+    # GIROS solo con el canal de módulo (el canal 1 es la fase, aleatoria)
+    "GIROS_AMP": dict(
+        channels=1, height=540, width=14,
+        base_dir=GIROS_DIR, root_dir=GIROS_ROOT_DIR,
+        make_dataset=GIROSTensorDataset,
+        channel_idx=[0], tag="_amp",
+    ),
     "CAEZ": dict(
-        channels=1, height=273, padded_height=288, width=10,
+        channels=1, height=273, width=10,
         base_dir=CAEZ_DIR, root_dir=CAEZ_ROOT_DIR,
         make_dataset=CAEZGridTensorDataset,
     ),
     "FRAUNHOFER": dict(
-        channels=1, height=49, padded_height=64, width=6,
+        channels=1, height=49, width=6,
         base_dir=FRAUNHOFER_DIR, root_dir=FRAUNHOFER_ROOT_DIR,
         make_dataset=FraunhoferTensorDataset,
+    ),
+    # 5GmmGesture: haces Tx (filas) x haces Rx (columnas), reducción en los dos ejes
+    "5GMMGESTURE": dict(
+        channels=1, height=50, width=56,
+        base_dir=MMGESTURE_DIR, root_dir=MMGESTURE_ROOT_DIR,
+        make_dataset=MMGestureTensorDataset,
+        down2d=True,
     ),
 }
 
 
 def get_spec(dataset_name, downsample=16):
-    """Datos del dataset, con el padding calculado para la reducción del encoder (16 o 4)."""
+    """
+    Datos del dataset con el padding calculado para la reducción del encoder.
+      - Normal: factor f_h = downsample en vertical, f_w = 1 en horizontal.
+      - down2d: f_h = f_w = sqrt(downsample) (x16 -> 4 x 4, x4 -> 2 x 2).
+    """
     if dataset_name not in DATASETS:
         raise ValueError(f"Dataset '{dataset_name}' no soportado. Opciones: {list(DATASETS)}")
     spec = dict(DATASETS[dataset_name])
     spec["downsample"] = downsample
-    spec["padded_height"] = math.ceil(spec["height"] / downsample) * downsample
+    spec["down2d"] = spec.get("down2d", False)
+    if spec["down2d"]:
+        f = int(round(math.sqrt(downsample)))
+        if f * f != downsample:
+            raise ValueError(f"Con reducción en los dos ejes, downsample debe ser 4 o 16, no {downsample}")
+        spec["f_h"], spec["f_w"] = f, f
+    else:
+        spec["f_h"], spec["f_w"] = downsample, 1
+    spec["padded_height"] = math.ceil(spec["height"] / spec["f_h"]) * spec["f_h"]
+    spec["padded_width"] = math.ceil(spec["width"] / spec["f_w"]) * spec["f_w"]
     return spec
 
 
@@ -77,19 +106,30 @@ def recon_dir(dataset_name, quantizer, downsample=16):
 
 def fit_to_spec(x, spec):
     """
-    (B, C, H, W) -> (B, C, padded_height, width):
+    (B, C, H, W) -> (B, C', padded_height, padded_width):
+      0. Si el dataset lo indica, se queda solo con algunos canales (GIROS_AMP: el módulo).
       1. Recorta a las filas reales (quita el padding que traiga el dataset del VQ-VAE).
-      2. Columnas: si faltan, replica los bordes (como en FAWN); si sobran, recorta.
+      2. Columnas:
+         - down2d: recorta a las columnas reales y rellena con ceros hasta padded_width;
+         - normal: si faltan, replica los bordes (como en FAWN); si sobran, recorta.
       3. Rellena con ceros al final del eje vertical hasta padded_height.
     """
+    if "channel_idx" in spec:
+        x = x[:, spec["channel_idx"], :, :]
     x = x[:, :, :spec["height"], :]
 
-    w = x.shape[-1]
-    if w < spec["width"]:
-        diff = spec["width"] - w
-        x = F.pad(x, (diff // 2, diff - diff // 2, 0, 0), mode="replicate")
-    elif w > spec["width"]:
+    if spec.get("down2d", False):
         x = x[..., :spec["width"]]
+        pad_w = spec["padded_width"] - x.shape[-1]
+        if pad_w > 0:
+            x = F.pad(x, (0, pad_w, 0, 0), mode="constant", value=0.0)
+    else:
+        w = x.shape[-1]
+        if w < spec["width"]:
+            diff = spec["width"] - w
+            x = F.pad(x, (diff // 2, diff - diff // 2, 0, 0), mode="replicate")
+        elif w > spec["width"]:
+            x = x[..., :spec["width"]]
 
     pad_h = spec["padded_height"] - x.shape[-2]
     if pad_h > 0:
@@ -115,9 +155,8 @@ def split_dataset(dataset, seed=42):
 
 def train_variance(train_data, spec, max_grids=20000, num_workers=0):
     """
-    Varianza de los valores del train, sin contar las filas de padding.
-    Como en el VQ-VAE: hasta 20.000 grids elegidos con semilla 0
-    (FAWN, GIROS y Fraunhofer tienen menos, así que se usan todos).
+    Varianza de los valores del train, sin contar el padding (ni filas ni columnas).
+    Como en el VQ-VAE: hasta 20.000 grids elegidos con semilla 0.
     """
     n = min(max_grids, len(train_data))
     idx = torch.randperm(len(train_data), generator=torch.Generator().manual_seed(0))[:n].tolist()
@@ -127,7 +166,7 @@ def train_variance(train_data, spec, max_grids=20000, num_workers=0):
     total_sum, total_sq, total_n = 0.0, 0.0, 0
     with torch.no_grad():
         for x, _ in loader:
-            x = x[:, :, :spec["height"], :].double()
+            x = x[:, :, :spec["height"], :spec["width"]].double()
             total_sum += x.sum().item()
             total_sq += (x ** 2).sum().item()
             total_n += x.numel()
@@ -138,7 +177,7 @@ def train_variance(train_data, spec, max_grids=20000, num_workers=0):
 def load_data(args, compute_variance=True):
     """
     Devuelve: train_loader, val_loader, test_data, x_train_var
-    Los grids salen como (B, C, padded_height, width) y los nombres como lista.
+    Los grids salen como (B, C, padded_height, padded_width) y los nombres como lista.
     """
     spec = get_spec(args.dataset, getattr(args, "downsample", 16))
     dataset = spec["make_dataset"](spec["root_dir"])
@@ -182,10 +221,11 @@ def to_image(t):
     return t[0].numpy()
 
 
-def plot_comparison(real_imgs, recon_imgs, height, save_path=None):
+def plot_comparison(real_imgs, recon_imgs, height, save_path=None, width=None):
     """Original frente a reconstrucción de la primera muestra del lote (sin padding)."""
-    real = to_image(real_imgs[0, :, :height, :].detach().float().cpu())
-    recon = to_image(recon_imgs[0, :, :height, :].detach().float().cpu())
+    w = width if width is not None else real_imgs.shape[-1]
+    real = to_image(real_imgs[0, :, :height, :w].detach().float().cpu())
+    recon = to_image(recon_imgs[0, :, :height, :w].detach().float().cpu())
 
     vmin, vmax = real.min(), real.max()
     fig, axes = plt.subplots(1, 2, figsize=(10, 6), sharey=True)

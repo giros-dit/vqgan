@@ -4,7 +4,9 @@ Original frente a reconstrucción del VQGAN para una muestra.
 
 Uso:
   python compare_vqgan.py --dataset FAWN --n_embeddings 512 --grid_name <nombre>
-Guarda por defecto en RESULTADOS/<DATASET>/compare_vqgan_<dataset>_K<K>_<grid>.pdf
+  python compare_vqgan.py --dataset FAWN --n_embeddings 512 --grid_name <nombre> --downsample 4
+Guarda por defecto en RESULTADOS/<DATASET>/ (x16) o RESULTADOSx4/<DATASET>/ (x4)
+con el nombre compare_vqgan_<dataset>_K<K>_<grid>.pdf
 """
 
 import argparse
@@ -84,23 +86,26 @@ def main():
     p = argparse.ArgumentParser(description="Comparar original frente a reconstrucción del VQGAN")
     p.add_argument("--dataset", required=True, choices=DATASETS.keys())
     p.add_argument("--quantizer", default="ema", choices=["ema", "original"])
+    p.add_argument("--downsample", type=int, default=16, choices=[4, 16],
+                   help="Reducción del VQGAN con que se hicieron las reconstrucciones")
     p.add_argument("--n_embeddings", type=int, default=512)
     p.add_argument("--grid_name", required=True, help="Nombre del fichero (con o sin .pt)")
     p.add_argument("--recon_dir", default=None,
-                   help="Carpeta de reconstrucciones (por defecto: <dataset>/vqgand_{q}/torch.float8_e4m3fn_{K})")
+                   help="Carpeta de reconstrucciones (por defecto: <dataset>/vqgand_{q}[_x4]/torch.float8_e4m3fn_{K})")
     p.add_argument("--output", default=None,
-                   help="Por defecto: RESULTADOS/<DATASET>/compare_vqgan_<dataset>_K<K>_<grid>.pdf")
+                   help="Por defecto: RESULTADOS[x4]/<DATASET>/compare_vqgan_<dataset>_K<K>_<grid>.pdf")
     args = p.parse_args()
 
     spec = get_spec(args.dataset)
     name = args.grid_name[:-3] if args.grid_name.endswith(".pt") else args.grid_name
     k = args.n_embeddings
+    carpeta = "RESULTADOS" if args.downsample == 16 else f"RESULTADOSx{args.downsample}"
 
     if args.recon_dir is None:
-        args.recon_dir = os.path.join(recon_dir(args.dataset, args.quantizer),
+        args.recon_dir = os.path.join(recon_dir(args.dataset, args.quantizer, args.downsample),
                                       f"torch.float8_e4m3fn_{k}")
     if args.output is None:
-        args.output = os.path.join("RESULTADOS", args.dataset,
+        args.output = os.path.join(carpeta, args.dataset,
                                    f"compare_vqgan_{args.dataset.lower()}_K{k}_{name}.pdf")
 
     orig_file = os.path.join(spec["root_dir"], f"{name}.pt")
@@ -112,7 +117,8 @@ def main():
         print(f"Error: no existe la reconstrucción en: {recon_file}")
         return
 
-    plot_comparison(orig_file, recon_file, title_extra=f" K={k}", save_path=args.output)
+    plot_comparison(orig_file, recon_file, title_extra=f" x{args.downsample} K={k}",
+                    save_path=args.output)
 
 
 if __name__ == "__main__":

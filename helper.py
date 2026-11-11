@@ -43,28 +43,27 @@ class ResidualBlock(nn.Module):
 
 class UpSampleBlock(nn.Module):
     """
-    Bloque de aumento asimétrico para CSI:
-    Duplica las subportadoras (frecuencia x2) y mantiene intactos
-    los 14 símbolos OFDM (tiempo x1).
+    Bloque de aumento. scale=(2, 1): duplica solo el eje vertical (lo de siempre).
+    scale=(2, 2): duplica los dos ejes (5GmmGesture).
     """
-    def __init__(self, channels):
+    def __init__(self, channels, scale=(2.0, 1.0)):
         super(UpSampleBlock, self).__init__()
+        self.scale = tuple(float(s) for s in scale)
         self.conv = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1)
 
     def forward(self, x):
-        x = F.interpolate(x, scale_factor=(2.0, 1.0), mode="nearest")
+        x = F.interpolate(x, scale_factor=self.scale, mode="nearest")
         return self.conv(x)
 
 
 class DownSampleBlock(nn.Module):
     """
-    Bloque de reducción asimétrico para CSI:
-    Aplica stride=(2, 1) con padding=1 para reducir a la mitad la frecuencia
-    manteniendo exactamente los 14 símbolos OFDM en el tiempo.
+    Bloque de reducción. stride=(2, 1): reduce a la mitad solo el eje vertical (lo de siempre).
+    stride=(2, 2): reduce a la mitad los dos ejes (5GmmGesture).
     """
-    def __init__(self, channels):
+    def __init__(self, channels, stride=(2, 1)):
         super(DownSampleBlock, self).__init__()
-        self.conv = nn.Conv2d(channels, channels, kernel_size=3, stride=(2, 1), padding=1)
+        self.conv = nn.Conv2d(channels, channels, kernel_size=3, stride=stride, padding=1)
 
     def forward(self, x):
         return self.conv(x)

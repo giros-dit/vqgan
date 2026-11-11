@@ -8,20 +8,19 @@ from quantizer import VectorQuantizer, VectorQuantizerEMA
 class VQGAN(nn.Module):
     """
     VQGAN para grids de canal: Encoder -> quant_conv -> cuantizador -> post_quant_conv -> Decoder.
-    Entrada (B, C, padded_H, W) -> latente (B, latent_dim, padded_H / 16, W) -> salida (B, C, padded_H, W).
 
     Necesita en args: image_channels, latent_dim, num_codebook_vectors, beta,
-    quantizer ("ema" | "original") y height (filas reales, para quitar el padding).
+    quantizer ("ema" | "original"), height y width (filas y columnas reales, para quitar el padding),
+    downsample (16 o 4) y down2d (reducción en los dos ejes, solo 5GmmGesture).
 
-    El cuantizador es EXACTAMENTE el mismo fichero que en el VQ-VAE (quantizer.py):
-      - "ema":      VectorQuantizerEMA (codebook por media móvil + reinicio de códigos muertos)
-      - "original": VectorQuantizer (codebook por gradiente, con el error heredado de beta)
+    El cuantizador es EXACTAMENTE el mismo fichero que en el VQ-VAE (quantizer.py).
     """
 
     def __init__(self, args):
         super(VQGAN, self).__init__()
         self.args = args
         self.height = getattr(args, "height", None)
+        self.width = getattr(args, "width", None)
         quantizer = getattr(args, "quantizer", "ema")
 
         self.encoder = Encoder(args)
@@ -49,7 +48,7 @@ class VQGAN(nn.Module):
         return z_q, indices.view(b, h, w), q_loss, perplexity
 
     def forward(self, imgs):
-        """Devuelve: reconstrucción (con padding), índices (B, H/16, W), q_loss, perplejidad."""
+        """Devuelve: reconstrucción (con padding), índices, q_loss, perplejidad."""
         z = self.quant_conv(self.encoder(imgs))
         z_q, indices, q_loss, perplexity = self.quantize(z)
         decoded = self.decoder(self.post_quant_conv(z_q))
@@ -65,10 +64,13 @@ class VQGAN(nn.Module):
         return self.decoder(self.post_quant_conv(z_q))
 
     def reconstruct(self, imgs, crop=True):
-        """Reconstrucción; con crop=True quita las filas de padding."""
+        """Reconstrucción; con crop=True quita las filas (y columnas) de padding."""
         decoded, _, _, _ = self.forward(imgs)
-        if crop and self.height is not None:
-            return decoded[:, :, :self.height, :]
+        if crop:
+            if self.height is not None:
+                decoded = decoded[:, :, :self.height, :]
+            if self.width is not None:
+                decoded = decoded[:, :, :, :self.width]
         return decoded
 
     def calculate_lambda(self, rec_loss, g_loss):

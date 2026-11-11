@@ -14,7 +14,7 @@ from vqgan import VQGAN
 class RawGridDataset(Dataset):
     """
     Lee cada fichero una sola vez y lo prepara como el compressor del VQ-VAE:
-    recorta a las filas reales, ajusta las columnas y rellena hasta padded_height.
+    recorta a las filas reales, ajusta las columnas y rellena hasta el tamaño con padding.
     Devuelve también el índice y la forma original para guardar la reconstrucción igual.
     """
 
@@ -90,16 +90,20 @@ def main():
     if hp.get("downsample", 16) != args.downsample:
         raise ValueError(f"El modelo se entrenó con --downsample {hp.get('downsample', 16)}, "
                          f"pero has puesto --downsample {args.downsample}")
+    if hp.get("down2d", False) != spec["down2d"]:
+        raise ValueError(f"El modelo se entrenó con down2d = {hp.get('down2d', False)}, "
+                         f"pero el dataset {args.dataset} tiene down2d = {spec['down2d']}")
 
     model = VQGAN(SimpleNamespace(**hp)).to(device)
     model.load_state_dict(checkpoint["model"])
     model.eval()
 
     K = hp["num_codebook_vectors"]
-    tokens = (spec["padded_height"] // spec["downsample"]) * spec["width"]
+    tokens = (spec["padded_height"] // spec["f_h"]) * (spec["padded_width"] // spec["f_w"])
     values = spec["channels"] * spec["height"] * spec["width"]
+    reduccion = f"{spec['f_h']} x {spec['f_w']}"
     print(f"[OK] Modelo cargado (K = {K}, dimensión = {hp['latent_dim']}, "
-          f"cuantizador = {hp['quantizer']}, reducción x{spec['downsample']})")
+          f"cuantizador = {hp['quantizer']}, reducción x{spec['downsample']} = {reduccion})")
     print(f"--> {tokens} tokens por grid | {tokens * np.log2(K) / values:.4f} bits por valor")
 
     # Misma lista de ficheros (y mismo orden) que en el entrenamiento
@@ -134,7 +138,7 @@ def main():
             for j in range(len(idxs)):
                 i = idxs[j].item()
                 w = w_origs[j].item()
-                left = (W - w) // 2          # columnas replicadas a la izquierda (si las hubo)
+                left = (W - w) // 2          # columnas replicadas a la izquierda (solo FAWN, si las hubo)
 
                 o = out[j, :, :, left:left + w].contiguous().clone()      # clone: guarda solo este grid
                 orig = x[j, :, :h, left:left + w]

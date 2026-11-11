@@ -5,7 +5,9 @@ con varios K, con la misma escala de colores en todos los paneles (la del origin
 
 Uso:
   python mosaico_vqgan.py --dataset FAWN --grid_name <nombre>
-Guarda por defecto en RESULTADOS/<DATASET>/mosaico_vqgan_<dataset>_<q>.pdf
+  python mosaico_vqgan.py --dataset FAWN --grid_name <nombre> --downsample 4
+Guarda por defecto en RESULTADOS/<DATASET>/ (x16) o RESULTADOSx4/<DATASET>/ (x4)
+con el nombre mosaico_vqgan_<dataset>_<q>.pdf
 """
 
 import argparse
@@ -58,6 +60,8 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--dataset", required=True, choices=DATASETS.keys())
     p.add_argument("--quantizer", default="ema", choices=["ema", "original"])
+    p.add_argument("--downsample", type=int, default=16, choices=[4, 16],
+                   help="Reducción del VQGAN con que se hicieron las reconstrucciones")
     p.add_argument("--grid_name", required=True, help="Nombre del fichero (con o sin .pt)")
     p.add_argument("--ks", type=int, nargs="+", default=[512, 128, 32, 8, 2])
     p.add_argument("--output", default=None)
@@ -66,7 +70,8 @@ def main():
     spec = get_spec(args.dataset)
     ylabel, xlabel = AXIS_LABELS.get(args.dataset, ("Fila", "Columna"))
     name = args.grid_name[:-3] if args.grid_name.endswith(".pt") else args.grid_name
-    recon_base = recon_dir(args.dataset, args.quantizer)
+    recon_base = recon_dir(args.dataset, args.quantizer, args.downsample)
+    carpeta = "RESULTADOS" if args.downsample == 16 else f"RESULTADOSx{args.downsample}"
 
     orig = load_chw(os.path.join(spec["root_dir"], f"{name}.pt"))
     if "channel_idx" in spec:                      # GIROS_AMP: solo el módulo
@@ -102,7 +107,7 @@ def main():
     fig.colorbar(im, ax=axes, shrink=0.9, label="Módulo", extend="both")
 
     out = args.output or os.path.join(
-        "RESULTADOS", args.dataset,
+        carpeta, args.dataset,
         f"mosaico_vqgan_{args.dataset.lower()}_{args.quantizer}.pdf")
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     fig.savefig(out, bbox_inches="tight")

@@ -11,13 +11,14 @@ from utils import DATASETS, get_spec, load_data, models_dir, weights_init, plot_
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Entrenamiento del VQGAN (FAWN / GIROS / CAEZ / FRAUNHOFER)")
+    p = argparse.ArgumentParser(description="Entrenamiento del VQGAN (FAWN / GIROS / CAEZ / FRAUNHOFER / 5GMMGESTURE)")
     p.add_argument("--dataset", type=str, default="GIROS", choices=DATASETS.keys())
     p.add_argument("--quantizer", type=str, default="ema", choices=["ema", "original"])
     p.add_argument("--n_embeddings", type=int, default=512, help="K: número de vectores del codebook")
     p.add_argument("--embedding_dim", type=int, default=64, help="Números por vector (igual que el VQ-VAE)")
     p.add_argument("--downsample", type=int, default=16, choices=[4, 16],
-                   help="Reducción del encoder en el eje vertical (16 = VQGAN original, 4 = como el VQ-VAE)")
+                   help="Reducción total del encoder (16 = VQGAN original, 4 = como el VQ-VAE). "
+                        "En 5GMMGESTURE se reparte entre los dos ejes (4 x 4 o 2 x 2)")
     p.add_argument("--beta", type=float, default=0.25)
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--n_updates", type=int, default=5000)
@@ -28,6 +29,8 @@ def parse_args():
                    help="Update a partir del cual actúa el discriminador")
     p.add_argument("--disc_factor", type=float, default=1.0,
                    help="Peso del discriminador (0 = sin discriminador, para la prueba de ablación)")
+    p.add_argument("--disc_norm", type=str, default="batch", choices=["batch", "none"],
+                   help="Normalización del discriminador (batch = BatchNorm, none = sin normalización)")
     p.add_argument("--log_interval", type=int, default=50)
     p.add_argument("--eval_interval", type=int, default=1000,
                    help="Cada cuántos updates se evalúa en validación y se guarda el modelo")
@@ -36,21 +39,24 @@ def parse_args():
     p.add_argument("--num_workers", type=int, default=2)
     p.add_argument("-save", action="store_true")
     p.add_argument("--filename", type=str, default=None,
-                   help="Ruta del .pth (por defecto: <dataset>/vqgan-models-{q}/nembeddings{K}/model.pth)")
-    p.add_argument("--disc_norm", type=str, default="batch", choices=["batch", "none"],
-                   help="Normalización del discriminador (batch = BatchNorm, none = sin normalización)")
+                   help="Ruta del .pth (por defecto: <dataset>/vqgan-models-{q}[_x4]/nembeddings{K}/model.pth)")
     args = p.parse_args()
 
-    # Lo que necesitan el modelo y el discriminador, sacado de la tabla de datasets
-    spec = get_spec(args.dataset)
+    # Lo que necesitan el modelo y el discriminador, sacado de la tabla de datasets.
+    # Todo esto se guarda en los hiperparámetros del checkpoint, y el compressor
+    # reconstruye el modelo exactamente igual a partir de ellos.
+    spec = get_spec(args.dataset, args.downsample)
     args.image_channels = spec["channels"]
     args.height = spec["height"]
+    args.width = spec["width"]
+    args.down2d = spec["down2d"]
     args.latent_dim = args.embedding_dim
     args.num_codebook_vectors = args.n_embeddings
 
     if args.filename is None:
         sub = f"nembeddings{args.n_embeddings}" + ("_sin_disc" if args.disc_factor == 0 else "")
-        args.filename = os.path.join(models_dir(args.dataset, args.quantizer, args.downsample), sub, "model.pth")
+        args.filename = os.path.join(models_dir(args.dataset, args.quantizer, args.downsample),
+                                     sub, "model.pth")
     return args
 
 
@@ -63,7 +69,7 @@ def nmse_ratios(real, recon):
 
 
 @torch.no_grad()
-def evaluate(vqgan, loader, height, device, max_batches=0):
+def evaluate(vqgan, loader, height, width, device, max_batches=0):
     """NMSE de validación: media en LINEAL de todos los grids y conversión a dB al final."""
     vqgan.eval()
     ratios, last = [], None
@@ -71,8 +77,8 @@ def evaluate(vqgan, loader, height, device, max_batches=0):
         if max_batches and b >= max_batches:
             break
         x = x.to(device)
-        recon = vqgan.reconstruct(x)              # ya sin filas de padding
-        ratios.append(nmse_ratios(x[:, :, :height, :], recon))
+        recon = vqgan.reconstruct(x)              # ya sin filas ni columnas de padding
+        ratios.append(nmse_ratios(x[:, :, :height, :width], recon))
         last = (x, recon)
     vqgan.train()
     r = torch.cat(ratios)
@@ -94,13 +100,16 @@ def save_checkpoint(path, vqgan, discriminator, results, args):
 def main():
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    h = args.height
-    plot_dir = os.path.join("resultados_vqgan", args.dataset, args.quantizer)
+    torch.backends.cudnn.benchmark = True   # elige las convoluciones más rápidas para estas formas
+    h, w = args.height, args.width
+    carpeta = "resultados_vqgan" if args.downsample == 16 else f"resultados_vqgan_x{args.downsample}"
+    plot_dir = os.path.join(carpeta, args.dataset, args.quantizer)
 
     print(f"--> Dispositivo: {device}")
-    print(f"--> Dataset: {args.dataset} | canales: {args.image_channels} | filas reales: {h}")
+    print(f"--> Dataset: {args.dataset} | canales: {args.image_channels} | tamaño real: {h} x {w}")
+    print(f"--> Reducción x{args.downsample}" + (" repartida en los dos ejes" if args.down2d else " en el eje vertical"))
     print(f"--> Cuantizador: {args.quantizer} | K = {args.n_embeddings} | dimensión = {args.embedding_dim}")
-    print(f"--> Discriminador: factor {args.disc_factor}, desde el update {args.disc_start}")
+    print(f"--> Discriminador: factor {args.disc_factor}, desde el update {args.disc_start}, norm = {args.disc_norm}")
     if args.save:
         print(f"--> Modelo: {args.filename}")
 
@@ -143,11 +152,11 @@ def main():
             train_iter = iter(train_loader)
             x, _ = next(train_iter)
         x = x.to(device)
-        x_real = x[:, :, :h, :]                   # sin filas de padding
+        x_real = x[:, :, :h, :w]                  # sin filas ni columnas de padding
 
         # ---------------- Generador (encoder + codebook + decoder) ----------------
         decoded, _, q_loss, perplexity = vqgan(x)
-        x_fake = decoded[:, :, :h, :]
+        x_fake = decoded[:, :, :h, :w]
 
         # Misma pérdida de reconstrucción que el VQ-VAE: MSE / varianza del train
         rec_loss = torch.mean((x_fake - x_real) ** 2) / x_train_var
@@ -156,7 +165,7 @@ def main():
         B = x_real.shape[0]
         if disc_factor > 0:
             # Real y reconstruido en el MISMO lote: con lotes separados la BatchNorm
-            # deja al discriminador distinguir lotes en vez de grids 
+            # deja al discriminador distinguir lotes en vez de grids (ver diagnóstico)
             logits = discriminator(torch.cat([x_real, x_fake], dim=0))
             g_loss = -torch.mean(logits[B:])
             lam = vqgan.calculate_lambda(rec_loss, g_loss)
@@ -211,12 +220,12 @@ def main():
             )
 
         if (i + 1) % args.eval_interval == 0 or (i + 1) == args.n_updates:
-            val_db, last = evaluate(vqgan, val_loader, h, device, args.val_batches)
+            val_db, last = evaluate(vqgan, val_loader, h, w, device, args.val_batches)
             results["val_nmse_db"].append((i + 1, val_db))
             tqdm.write(f"[Update {i + 1}] NMSE de validación: {val_db:.2f} dB")
             if last is not None:
                 plot_comparison(last[0], last[1], h, save_path=os.path.join(
-                    plot_dir, f"val_K{args.n_embeddings}_upd{i + 1}.png"))
+                    plot_dir, f"val_K{args.n_embeddings}_upd{i + 1}.png"), width=w)
             if args.save:
                 save_checkpoint(args.filename, vqgan, discriminator, results, args)
 
@@ -228,6 +237,5 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 
